@@ -1,0 +1,264 @@
+diff --git a/tests/ut/device_allocator/test_cpu_binding.py b/tests/ut/device_allocator/test_cpu_binding.py
+index a479c8ac1..a68d682cf 100644
+--- a/tests/ut/device_allocator/test_cpu_binding.py
++++ b/tests/ut/device_allocator/test_cpu_binding.py
+@@ -133,6 +133,25 @@ class TestDeviceInfo(unittest.TestCase):
+             },
+         )
+ 
++    @patch("vllm_ascend.cpu_binding.execute_command")
++    def test_get_npu_phy_id_to_card_id(self, mock_execute_command):
++        mock_execute_command.return_value = (
++            "NPU ID  Chip ID  Chip Logic ID  Chip Phy-ID  Chip Name\n"
++            "1 0 0 2 Ascend910\n"
++            "1 1 1 3 Ascend910\n"
++            "1 2 - - Mcu\n"
++            "4 0 2 8 Ascend910\n"
++            "4 1 3 9 Ascend910\n"
++            "4 2 - - Mcu",
++            0,
++        )
++
++        self.assertEqual(
++            self.device_info.get_npu_phy_id_to_card_id(),
++            {"2": "1", "3": "1", "8": "4", "9": "4"},
++        )
++        mock_execute_command.assert_called_once_with(["npu-smi", "info", "-m"], timeout=10)
++
+     @patch("vllm_ascend.cpu_binding.execute_command")
+     def test_get_running_npus(self, mock_execute_command):
+         mock_execute_command.side_effect = [
+diff --git a/vllm_ascend/cpu_binding.py b/vllm_ascend/cpu_binding.py
+index 3f2bb751b..c795f1cb9 100644
+--- a/vllm_ascend/cpu_binding.py
++++ b/vllm_ascend/cpu_binding.py
+@@ -41,7 +41,7 @@ def is_arm_cpu() -> bool:
+     return False
+ 
+ 
+-def execute_command(cmd: list[str]) -> tuple[str, int]:
++def execute_command(cmd: list[str], timeout: float = 1000) -> tuple[str, int]:
+     # Force a C locale so subprocess output remains parseable on localized OSes.
+     env = os.environ.copy()
+     env["LC_ALL"] = "C"
+@@ -49,7 +49,7 @@ def execute_command(cmd: list[str]) -> tuple[str, int]:
+     env["LC_MESSAGES"] = "C"
+     with subprocess.Popen(cmd, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env) as p:
+         try:
+-            out, _ = p.communicate(timeout=1000)
++            out, _ = p.communicate(timeout=timeout)
+         except subprocess.TimeoutExpired:
+             p.kill()
+             out, _ = p.communicate()
+@@ -128,6 +128,40 @@ class DeviceInfo:
+             npu_map_info[npu_id][chip_id] = chip_logic_id
+         return npu_map_info
+ 
++    @staticmethod
++    def get_npu_phy_id_to_card_id() -> dict[str, str]:
++        """Return the npu-smi card ID for each chip Phy-ID.
++
++        ``npu-smi info -i`` expects an NPU ID (card ID), while the CANN
++        runtime physical-device lookup returns a chip Phy-ID. The two differ
++        when several chips share a card or when devices are remapped.
++        """
++        # Health checks must not inherit the long CPU-binding discovery timeout.
++        npu_info, return_code = execute_command(["npu-smi", "info", "-m"], timeout=10)
++        if return_code != 0:
++            raise RuntimeError(f"'npu-smi info -m' failed with exit code {return_code}")
++
++        npu_map = [line.strip() for line in npu_info.splitlines() if line.strip()]
++        if not npu_map:
++            raise RuntimeError("'npu-smi info -m' returned no output")
++
++        header = DeviceInfo.split_npu_smi_header(npu_map[0])
++        if "NPU ID" not in header or "Chip Phy-ID" not in header:
++            return {}
++
++        npu_id_idx = header.index("NPU ID")
++        chip_phy_id_idx = header.index("Chip Phy-ID")
++        max_required_idx = max(npu_id_idx, chip_phy_id_idx)
++        phy_id_to_card_id: dict[str, str] = {}
++        for line in npu_map[1:]:
++            parts = line.split()
++            if len(parts) <= max_required_idx:
++                continue
++            chip_phy_id = parts[chip_phy_id_idx]
++            if chip_phy_id.isdigit():
++                phy_id_to_card_id[chip_phy_id] = parts[npu_id_idx]
++        return phy_id_to_card_id
++
+     def resolve_logic_id(self, npu_id: str, chip_id: str | None) -> int:
+         chip_map = self.npu_map_info.get(npu_id, {})
+         if chip_id is not None:
+diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
+index 7e2016808..5125d2256 100644
+--- a/vllm_ascend/worker/worker.py
++++ b/vllm_ascend/worker/worker.py
+@@ -92,7 +92,7 @@ from vllm_ascend.core.kv_cache_placement import (
+     create_kvpp_cache_allocation_plan,
+     register_kvpp_draft_layers,
+ )
+-from vllm_ascend.cpu_binding import bind_cpus
++from vllm_ascend.cpu_binding import DeviceInfo, bind_cpus
+ from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+ from vllm_ascend.device_allocator.camem import CaMemAllocator
+ from vllm_ascend.device_allocator.sleep_mem_optimized import SleepWakeupManager
+@@ -1421,8 +1421,9 @@ class NPUWorker(GPUWorker):
+ 
+         logger.debug("check_health starting for rank %s...", self.local_rank)
+         try:
++            card_id = resolve_card_id_for_health(self.local_rank)
+             result = subprocess.run(
+-                ["npu-smi", "info", "-i", str(self.local_rank), "-t", "health"],
++                ["npu-smi", "info", "-i", str(card_id), "-t", "health"],
+                 capture_output=True,
+                 text=True,
+                 timeout=10,
+@@ -1430,9 +1431,9 @@ class NPUWorker(GPUWorker):
+ 
+             if result.returncode == 0:
+                 parse_text_output(result.stdout)
+-                logger.debug("check_health success for rank %s.", self.local_rank)
++                logger.debug("check_health success for rank %s on card %s.", self.local_rank, card_id)
+             else:
+-                logger.warning("query NPU card %s fail: %s", self.local_rank, result.stderr)
++                logger.warning("query NPU card %s fail: %s", card_id, result.stderr)
+         except subprocess.TimeoutExpired:
+             logger.warning("query NPU card %s timeout.", self.local_rank)
+         except FileNotFoundError:
+@@ -1442,6 +1443,31 @@ class NPUWorker(GPUWorker):
+         return
+ 
+ 
++def resolve_card_id_for_health(local_rank: int) -> int:
++    """Resolve a vLLM local rank to the npu-smi NPU ID (card ID).
++
++    A local rank identifies a chip, but ``npu-smi info -i`` expects the
++    physical card. On multi-chip cards and remapped/container environments
++    these IDs differ. Resolve the bound runtime device to its chip Phy-ID and
++    map that ID to the card reported by ``npu-smi info -m``.
++    """
++    try:
++        visible_device_id = current_platform.logical_device_id_to_visible_device_id(local_rank)
++        chip_phy_id = current_platform.visible_device_id_to_physical_device_id(visible_device_id)
++        card_id = DeviceInfo.get_npu_phy_id_to_card_id().get(str(chip_phy_id))
++        if card_id is not None:
++            return int(card_id)
++    except Exception as e:
++        logger.debug("Failed to resolve npu-smi card ID for rank %s: %s", local_rank, e)
++
++    # Preserve a best-effort mapping on older hosts whose npu-smi output does
++    # not expose Chip Phy-ID. On single-chip cards the physical ID is the card.
++    try:
++        return current_platform.device_id_to_physical_device_id(local_rank)
++    except Exception:
++        return local_rank
++
++
+ def parse_text_output(output) -> None:
+     lines = output.strip().split("\n")
+     for i, line in enumerate(lines):
+diff --git a/tests/ut/worker/test_worker_check_health.py b/tests/ut/worker/test_worker_check_health.py
+new file mode 100644
+index 000000000..c5eed925d
+--- /dev/null
++++ b/tests/ut/worker/test_worker_check_health.py
+@@ -0,0 +1,79 @@
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from tests.ut.base import TestBase
++from vllm_ascend.cpu_binding import DeviceInfo
++from vllm_ascend.worker.worker import NPUWorker, resolve_card_id_for_health
++
++WORKER_MODULE = "vllm_ascend.worker.worker"
++
++NPU_SMI_MAP = """\
++NPU ID  Chip ID  Chip Logic ID  Chip Phy-ID  Chip Name
++1  0  0  2  Ascend910
++1  1  1  3  Ascend910
++1  2  -  -  Mcu
++4  0  2  8  Ascend910
++4  1  3  9  Ascend910
++4  2  -  -  Mcu
++"""
++
++
++class TestResolveCardIdForHealth(TestBase):
++    def test_uses_phy_id_not_chip_logic_id(self):
++        with (
++            patch(f"{WORKER_MODULE}.current_platform") as platform,
++            patch.object(
++                DeviceInfo,
++                "get_npu_phy_id_to_card_id",
++                return_value={"2": "1", "3": "1", "8": "4", "9": "4"},
++            ),
++        ):
++            platform.logical_device_id_to_visible_device_id.return_value = 0
++            platform.visible_device_id_to_physical_device_id.return_value = 2
++            assert resolve_card_id_for_health(0) == 1
++
++            platform.visible_device_id_to_physical_device_id.return_value = 8
++            assert resolve_card_id_for_health(0) == 4
++
++    def test_falls_back_when_npu_smi_map_is_unavailable(self):
++        with (
++            patch(f"{WORKER_MODULE}.current_platform") as platform,
++            patch.object(DeviceInfo, "get_npu_phy_id_to_card_id", side_effect=RuntimeError("no npu-smi")),
++        ):
++            platform.logical_device_id_to_visible_device_id.return_value = 0
++            platform.visible_device_id_to_physical_device_id.return_value = 2
++            platform.device_id_to_physical_device_id.return_value = 5
++            assert resolve_card_id_for_health(0) == 5
++
++    def test_check_health_queries_mapped_card(self):
++        worker = NPUWorker.__new__(NPUWorker)
++        worker.local_rank = 0
++        completed = SimpleNamespace(
++            returncode=0,
++            stdout="Health : OK\n",
++            stderr="",
++        )
++        with (
++            patch(f"{WORKER_MODULE}.resolve_card_id_for_health", return_value=1),
++            patch("subprocess.run", return_value=completed) as run,
++        ):
++            worker.check_health()
++
++        run.assert_called_once()
++        assert run.call_args.args[0] == ["npu-smi", "info", "-i", "1", "-t", "health"]
+diff --git a/release_notes/fragments/pending-check-health-card-id.yaml b/release_notes/fragments/pending-check-health-card-id.yaml
+new file mode 100644
+index 000000000..148481e17
+--- /dev/null
++++ b/release_notes/fragments/pending-check-health-card-id.yaml
+@@ -0,0 +1,12 @@
++# Temporary fragment for the fix before GitHub assigns a PR number.
++# Rename this file to release_notes/fragments/<PR-number>.yaml and replace
++# the placeholder below before submitting the PR.
++pr: 0
++entries:
++  - category: bugfix
++    text: >-
++      Fixed worker health checks on hosts where NPU card IDs differ from
++      logical device IDs, including multi-chip cards and
++      `ASCEND_RT_VISIBLE_DEVICES` remapping. The check now monitors the card
++      that hosts the worker's bound chip instead of reporting another card's
++      health or failing with `Invalid card id`.
