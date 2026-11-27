@@ -1,0 +1,47 @@
+# [Doc][KVPP] Correct the P/D node labels in the support matrix
+
+### What this PR does / why we need it?
+
+The support matrix incorrectly described KVPP as decode-only, while the KVPP
+guide and startup validation require it to be enabled only on prefill nodes.
+
+- Correct four `KVPP(only D node)` labels in the English support matrix.
+- Correct `KVPP(仅 D 节点)` in the Chinese translation.
+
+### Does this PR introduce _any_ user-facing change?
+
+No. This is a documentation-only correction; runtime behavior and public APIs
+are unchanged.
+
+### How was this patch tested?
+
+```bash
+make -f docs/Makefile build
+make -f docs/Makefile build-zh
+
+! rg 'KVPP\(only D node\)|KVPP\(仅 D 节点\)' \
+  docs/source/user_guide/support_matrix/supported_models.md \
+  docs/source/locale/zh_CN/LC_MESSAGES/user_guide/support_matrix/supported_models.po
+
+rg -n 'KVPP\(仅 P 节点\)' \
+  docs/source/zh/user_guide/support_matrix/supported_models.md
+
+npx --yes markdownlint-cli@0.45.0 -c .markdownlint.yaml \
+  docs/source/user_guide/support_matrix/supported_models.md
+
+python .github/workflows/scripts/check_md_links.py \
+  docs/source/user_guide/support_matrix/supported_models.md --timeout 300
+
+git diff --check
+```
+
+The English and Chinese documentation builds completed successfully. The
+changed Markdown file passed `markdownlint`; the link checker finished with no
+blocking errors and reported zero remote URLs to scan because this page uses
+relative links. The English and generated Chinese matrix rows both contain 42
+columns, and the generated Chinese page contains `KVPP(仅 P 节点)`.
+
+## Files
+
+- `docs/source/user_guide/support_matrix/supported_models.md`
+- `docs/source/locale/zh_CN/LC_MESSAGES/user_guide/support_matrix/supported_models.po`
