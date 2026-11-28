@@ -1,0 +1,186 @@
+# Issue（中文版）
+
+**标题**：`[Docs] 安装文档"支持的硬件"表格中的参考链接在 readthedocs 上 404`
+
+**Label 建议**：`bug`（或 `documentation`，若无此 label 则用 bug）
+
+---
+
+### 问题描述
+
+https://swift.readthedocs.io/zh-cn/latest/GetStarted/SWIFT-installation.html#支持的硬件
+页面中"支持的硬件"表格的 4 个参考链接（AMD GPU / Huawei Ascend NPU / 沐曦 MetaX / 摩尔线程 MUSA）
+在渲染后的 HTML 中指向原始 `../BestPractices/*-support.md` 路径，点击后 404：
+
+```
+href="../BestPractices/AMD-support.md"    → 404
+href="../BestPractices/NPU-support.md"    → 404
+href="../BestPractices/Metax-support.md"  → 404
+href="../BestPractices/MUSA-support.md"   → 404
+```
+
+表格之外的相对链接均正常（正确改写为 .html），如 FAQ 页中的 AMD-support.html。
+
+### 根因
+
+`docs/source/conf.py` 与 `docs/source_en/conf.py` 中启用了 `sphinx_markdown_tables` 扩展。
+该扩展会把 Markdown 表格预转换成 raw HTML 插入 doctree，MyST parser 因此无法对表格
+单元格内部的相对 `.md` 链接执行 `.md → .html` 改写，导致 raw 路径原样输出到 HTML。
+
+该扩展是 2023 年为 recommonmark（不支持表格渲染）引入的遗留配置；项目现已使用
+myst_parser（原生支持 pipe table），该扩展已无必要，反而破坏表格内链接。
+
+除安装页 4 个链接外，`docs/source/Megatron-SWIFT/GKD.md` 表格内的蒸馏文档链接
+（`../Instruction/Distillation.md#multi-teacher多教师路由`）存在同样问题，共 5 处。
+
+### 如何复现
+
+本地构建即可复现：
+
+```
+pip install -r requirements/docs.txt
+sphinx-build -b html docs/source /tmp/out
+grep 'support\.' /tmp/out/GetStarted/SWIFT-installation.html
+# 输出中同时存在 .md 与 .html 两种 href
+```
+
+### 环境信息
+
+- 复现环境与线上 readthedocs 构建一致（sphinx + myst_parser + sphinx_markdown_tables，见 requirements/docs.txt）
+- 不涉及 ms-swift 运行时，纯文档构建问题
+
+### 修复建议
+
+移除 `sphinx_markdown_tables`（两棵文档树的 conf.py 及 requirements/docs.txt）。
+本地验证：修复后硬件链接全部输出为 `BestPractices/*-support.html`，
+表格渲染数量不变（构建前后均为 69 个 table），无其他回归。
+
+修复 patch 见关联 PR（已在本地验证通过，pre-commit 全部通过）。
+
+
+
+
+diff --git a/docs/source/conf.py b/docs/source/conf.py
+index f638b535f..c908e9ba4 100644
+--- a/docs/source/conf.py
++++ b/docs/source/conf.py
+@@ -46,7 +46,6 @@ extensions = [
+     'sphinx.ext.autosummary',
+     'sphinx.ext.autodoc',
+     'sphinx.ext.viewcode',
+-    'sphinx_markdown_tables',
+     'sphinx_copybutton',
+     'myst_parser',
+ ]
+diff --git a/docs/source_en/conf.py b/docs/source_en/conf.py
+index a63cc481f..becbc08ba 100644
+--- a/docs/source_en/conf.py
++++ b/docs/source_en/conf.py
+@@ -46,7 +46,6 @@ extensions = [
+     'sphinx.ext.autosummary',
+     'sphinx.ext.autodoc',
+     'sphinx.ext.viewcode',
+-    'sphinx_markdown_tables',
+     'sphinx_copybutton',
+     'myst_parser',
+ ]
+diff --git a/requirements/docs.txt b/requirements/docs.txt
+index 17c7a051a..447886bee 100644
+--- a/requirements/docs.txt
++++ b/requirements/docs.txt
+@@ -5,5 +5,4 @@ sphinx>=5.3.0
+ sphinx-book-theme
+ sphinx-copybutton
+ sphinx-rtd-theme
+-sphinx_markdown_tables
+ sphinxcontrib-mermaid
+-- 
+2.34.1
+
+
+
+
+
+
+
+docs: drop sphinx_markdown_tables to fix .md links inside tables
+
+sphinx_markdown_tables pre-converts Markdown tables into raw HTML, so
+MyST no longer rewrites relative .md links inside table cells to .html.
+This broke the four "Supported Hardware" reference links on the
+installation page (AMD/NPU/MetaX/MUSA) on readthedocs, plus one link in
+Megatron-SWIFT/GKD.
+
+myst_parser natively supports pipe tables, so the extension is
+redundant: remove it from both conf.py files and requirements/docs.txt.
+
+Local build verified: the hardware links now render as
+BestPractices/*-support.html in both zh/en trees, table count unchanged
+(69 tables in both trees before/after).
+
+Fixes #<issue号>
+
+
+**PR 标题**：`docs: drop sphinx_markdown_tables to fix .md links inside tables`
+
+**源分支**：`fix/docs-hardware-table-links` → `main`
+
+> 提交前先创建 issue，把下面所有 `#<issue号>` 替换成真实编号。
+
+---
+
+## PR type
+Bug fix (documentation build)
+
+## What does this PR do?
+Fixes #<issue号>
+
+## Problem
+On readthedocs, the four "Supported Hardware" reference links on the
+installation page (AMD/NPU/MetaX/MUSA) point to raw
+`../BestPractices/*-support.md` paths and 404. The in-table distillation-docs
+link in `Megatron-SWIFT/GKD.md` is broken the same way (5 links total).
+
+## Root cause
+`sphinx_markdown_tables` pre-converts Markdown tables into raw HTML, so MyST
+never rewrites relative `.md` links inside table cells to `.html`. The
+extension dates back to the recommonmark era (2023, #77); myst_parser handles
+pipe tables natively, making the extension redundant and harmful.
+
+## Fix
+Remove `sphinx_markdown_tables` from:
+- `docs/source/conf.py`
+- `docs/source_en/conf.py`
+- `requirements/docs.txt`
+
+## Experiment results
+
+Commands (run at repo root):
+
+```
+pip install -r requirements/docs.txt
+sphinx-build -b html docs/source /tmp/out-zh
+sphinx-build -b html docs/source_en /tmp/out-en
+pre-commit run --all-files
+```
+
+Results:
+- Hardware links render as `BestPractices/{AMD,NPU,Metax,MUSA}-support.html`
+  in both zh and en trees (verified via grep on generated HTML)
+- GKD in-table link renders as `../Instruction/Distillation.html#...`
+- Table count unchanged: 69 tables in both trees before/after (no rendering
+  regression)
+- Full-tree scan: remaining raw `.md` hrefs are only legit `_sources/*.md.txt`
+  viewer links and external links
+- `pre-commit run --all-files`: all checks passed
+
+## Checklist
+- [x] I have read and follow CONTRIBUTING.md
+- [x] Related issue is linked (Fixes #<issue号>)
+- [x] Docs updated (build config; no user-facing .md content changed)
+- [x] pre-commit run --all-files passed
+- [x] AI assistance was used (Claude Code); commit carries
+      `Co-authored-by: Claude` trailer. The submitting human has reviewed
+      every changed line and run the tests above.
+
+
